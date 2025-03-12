@@ -154,9 +154,16 @@ class MemoryController {
             stack.errorCount = 0;
             stack.accessCount = 0;
             
+            let recoveredItems = 0;
             for (const item of backupData) {
-                if (this.validateData(item)) {
-                    stack.data.push(item);
+                try {
+                    if (this.validateData(item)) {
+                        stack.data.push(item);
+                        recoveredItems++;
+                    }
+                } catch (itemError) {
+                    Logger.memoryStackOperation(stack.id, 'RECOVERY_ITEM_ERROR', 
+                        `Failed to recover item: ${itemError.message}`);
                 }
             }
             
@@ -166,6 +173,19 @@ class MemoryController {
         } catch (error) {
             Logger.memoryStackOperation(stack.id, 'CRITICAL', 
                 `Stack recovery failed: ${error.message}`);
+            // Try to at least preserve some of the original data instead of losing everything
+            try {
+                stack.data = backupData.filter(item => this.validateData(item));
+                stack.errorCount = this.maxErrorThreshold - 1; // Reset below threshold
+                Logger.memoryStackOperation(stack.id, 'EMERGENCY_RECOVERY', 
+                    `Emergency recovery with ${stack.data.length}/${backupData.length} items`);
+                MemoryMonitor.updateMemoryStats(stack.id, stack.data.length);
+            } catch (emergencyError) {
+                Logger.memoryStackOperation(stack.id, 'CRITICAL', 
+                    `Emergency recovery failed: ${emergencyError.message}`);
+                stack.data = [];
+                MemoryMonitor.updateMemoryStats(stack.id, 0);
+            }
             throw new Error('Stack recovery failed');
         }
     }
@@ -173,11 +193,17 @@ class MemoryController {
     async lockStack(stackId) {
         const stack = this.memoryStacks.find(s => s.id === stackId);
         if (!stack) throw new Error('Invalid stack ID');
-
+    
         if (stack.isLocked) {
             throw new Error('Stack is already locked');
         }
-
+    
+        // Clear any existing timeout to prevent memory leaks
+        if (stack.lockTimeout) {
+            clearTimeout(stack.lockTimeout);
+            stack.lockTimeout = null;
+        }
+    
         stack.isLocked = true;
         
         stack.lockTimeout = setTimeout(() => {
@@ -188,7 +214,7 @@ class MemoryController {
                 MemoryMonitor.recordOperation(stackId, 'errors', this.lockTimeoutDuration);
             }
         }, this.lockTimeoutDuration);
-
+    
         Logger.memoryStackOperation(stackId, 'LOCK', 'Stack locked with timeout protection');
     }
 
@@ -220,13 +246,25 @@ class MemoryController {
         const originalSize = stack.data.length;
         const itemsToKeep = Math.floor(stack.data.length * 0.8);
         
-        if (stack.data[0] && stack.data[0].lastAccess) {
-            stack.data.sort((a, b) => b.lastAccess - a.lastAccess);
+        try {
+            if (stack.data[0] && stack.data[0].lastAccess) {
+                stack.data.sort((a, b) => {
+                    // Secure sorting with support for undefined values
+                    const lastAccessA = a.lastAccess || 0;
+                    const lastAccessB = b.lastAccess || 0;
+                    return lastAccessB - lastAccessA;
+                });
+            }
+            
+            stack.data = stack.data.slice(-itemsToKeep);
+            Logger.memoryStackOperation(stack.id, 'OPTIMIZE', 
+                `Stack optimized: ${originalSize} -> ${stack.data.length} items`);
+        } catch (error) {
+            Logger.memoryStackOperation(stack.id, 'OPTIMIZE_ERROR', 
+                `Optimization error: ${error.message}. Removing oldest items.`);
+            // Fallback: simple optimization by removing older elements
+            stack.data = stack.data.slice(-itemsToKeep);
         }
-        
-        stack.data = stack.data.slice(-itemsToKeep);
-        Logger.memoryStackOperation(stack.id, 'OPTIMIZE', 
-            `Stack optimized: ${originalSize} -> ${stack.data.length} items`);
             
         MemoryMonitor.recordOperation(stack.id, 'optimizations', Date.now() - startTime);
         MemoryMonitor.updateMemoryStats(stack.id, stack.data.length);

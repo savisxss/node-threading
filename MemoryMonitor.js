@@ -65,21 +65,64 @@ class MemoryMonitor {
     takeSnapshot(stackId) {
         const currentStats = this.statistics.get(stackId);
         if (!currentStats) return;
-
-        const snapshot = {
-            timestamp: Date.now(),
-            ...JSON.parse(JSON.stringify(currentStats))
-        };
-
-        if (!this.snapshots.has(stackId)) {
-            this.snapshots.set(stackId, []);
+    
+        try {
+            // Create a copy of the statistics with a simplified structure
+            const snapshot = {
+                timestamp: Date.now(),
+                operations: { ...currentStats.operations },
+                performance: { 
+                    averageOperationTime: currentStats.performance.averageOperationTime,
+                    operationCount: currentStats.performance.operationCount
+                },
+                memory: { 
+                    currentSize: currentStats.memory.currentSize,
+                    peakSize: currentStats.memory.peakSize
+                },
+                health: { 
+                    status: currentStats.health.status,
+                    errorRate: currentStats.health.errorRate
+                }
+            };
+    
+            if (!this.snapshots.has(stackId)) {
+                this.snapshots.set(stackId, []);
+            }
+            
+            const stackSnapshots = this.snapshots.get(stackId);
+            stackSnapshots.push(snapshot);
+    
+            // Limiting the number of snapshots and cleaning up old ones
+            if (stackSnapshots.length > 100) {
+                // Instead of deleting individual snapshots, keep only the last 50
+                const newSnapshots = stackSnapshots.slice(-50);
+                this.snapshots.set(stackId, newSnapshots);
+            }
+        } catch (error) {
+            console.error(`Error taking snapshot for stack #${stackId}:`, error);
         }
-        
-        const stackSnapshots = this.snapshots.get(stackId);
-        stackSnapshots.push(snapshot);
+    }
 
-        if (stackSnapshots.length > 100) {
-            stackSnapshots.shift();
+    // Cean up old snapshots
+    cleanupOldSnapshots(stackId) {
+        try {
+            const stackSnapshots = this.snapshots.get(stackId);
+            if (!stackSnapshots || stackSnapshots.length <= 50) return;
+            
+            // Keep only the last 25 snapshots and every fourth older snapshot
+            const recentSnapshots = stackSnapshots.slice(-25);
+            const olderSnapshots = stackSnapshots.slice(0, -25);
+            
+            // With olderSnapshots keep every fourth snapshot
+            const sampledOlderSnapshots = olderSnapshots.filter((_, index) => index % 4 === 0);
+            
+            // Combine the two groups
+            this.snapshots.set(stackId, [...sampledOlderSnapshots, ...recentSnapshots]);
+            
+            Logger.memoryStackOperation(stackId, 'CLEANUP', 
+                `Snapshots optimized: ${stackSnapshots.length} -> ${this.snapshots.get(stackId).length}`);
+        } catch (error) {
+            console.error(`Error cleaning up snapshots for stack #${stackId}:`, error);
         }
     }
 
@@ -143,22 +186,36 @@ class MemoryMonitor {
     }
 
     startMonitoring(interval = 60000) {
+        // Keep the existing interval, if any
+        this.stopMonitoring();
+        
         this.monitoringInterval = setInterval(() => {
-            for (const [stackId] of this.statistics) {
-                const health = this.getStackHealth(stackId);
-                this.takeSnapshot(stackId);
-
-                const statusColors = {
-                    healthy: '\x1b[32m',
-                    warning: '\x1b[33m',
-                    critical: '\x1b[31m'
-                };
-
-                Logger.memoryStackOperation(stackId, 'MONITOR', 
-                    `${statusColors[health.status]}Status: ${health.status}\x1b[0m, ` +
-                    `Error Rate: ${(health.errorRate * 100).toFixed(2)}%, ` +
-                    `Lock Count: ${health.lockCount}`
-                );
+            try {
+                for (const [stackId] of this.statistics) {
+                    try {
+                        const health = this.getStackHealth(stackId);
+                        this.takeSnapshot(stackId);
+    
+                        const statusColors = {
+                            healthy: '\x1b[32m',
+                            warning: '\x1b[33m',
+                            critical: '\x1b[31m'
+                        };
+    
+                        Logger.memoryStackOperation(stackId, 'MONITOR', 
+                            `${statusColors[health.status || 'warning']}Status: ${health.status || 'unknown'}\x1b[0m, ` +
+                            `Error Rate: ${((health.errorRate || 0) * 100).toFixed(2)}%, ` +
+                            `Lock Count: ${health.lockCount || 0}`
+                        );
+                        
+                        // Checking memory occupancy and clearing if needed
+                        this.cleanupOldSnapshots(stackId);
+                    } catch (stackError) {
+                        console.error(`Error monitoring stack #${stackId}:`, stackError);
+                    }
+                }
+            } catch (error) {
+                console.error('Error in monitoring loop:', error);
             }
         }, interval);
     }
